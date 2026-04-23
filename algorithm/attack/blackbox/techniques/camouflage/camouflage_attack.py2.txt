@@ -1,0 +1,80 @@
+import torch
+import numpy as np
+from algorithm.attack.base import Query
+
+print("🔥 CAMOUFLAGE V5 (HSJA ENGINE + STEALTH FLUSH) LOADED")
+
+class CamouflageAttack(object):
+    def __init__(self, device, model=None, q_budgets=None, stop=True, data_type='cifar10', cfg=None):
+        self.device = device
+        self.model = model
+        self.q_budgets = q_budgets if q_budgets is not None else [10000]
+
+        # --- HSJA Style Params ---
+        self.alpha = 0.05       # Step size for boundary movement
+        self.gamma = 1.0        # Trajectory diversification factor
+        self.ref_pool = []
+
+    def set_adaptive(self, adapt_type, move_rate, batch_size, x2_pool):
+        if x2_pool is not None:
+            self.ref_pool = x2_pool[:50]
+        print(f"[*] Camouflage V5 Synced. Pool Size: {len(self.ref_pool)}")
+
+    def query(self, x):
+        if x.dim() == 3: x = x.unsqueeze(0)
+        with torch.no_grad():
+            q = Query(t='attack', x=x)
+            return self.model(q)
+
+    def get_ref(self):
+        if len(self.ref_pool) == 0: return None
+        idx = np.random.randint(0, len(self.ref_pool))
+        return self.ref_pool[idx].to(self.device)
+
+    def core(self, x_start, y):
+        x_adv = x_start.clone().detach().squeeze(0)
+        target_class = y.item()
+        T = int(self.q_budgets[0])
+        
+        # 1. Initial Perturbation (To start away from boundary)
+        x_adv = x_adv + 0.01 * torch.sign(torch.randn_like(x_adv)).to(self.device)
+        
+        for t in range(T):
+            # --- HSJA LOGIC: Boundary Estimation ---
+            # Random direction search like HSJA
+            u = torch.randn_like(x_adv).to(self.device)
+            u = u / (torch.norm(u) + 1e-8)
+            
+            # Probe query
+            x_probe = x_adv + self.alpha * u
+            x_probe = torch.clamp(x_probe, 0, 1)
+            
+            out = self.query(x_probe)
+            pred = torch.argmax(out, dim=1).item()
+            
+            # Boundary movement logic
+            if pred != target_class:
+                x_adv = x_probe # Move to adversarial space
+            else:
+                # Diversification: If not adversarial, shift trajectory
+                x_adv = x_adv + (self.alpha * self.gamma) * u
+            
+            # --- CAMOUFLAGE LOGIC: Stealth Flush ---
+            # Har 3 query ke baad benign sample bhej kar detector memory reset karna
+            if t % 3 == 0:
+                x_ref = self.get_ref()
+                if x_ref is not None:
+                    _ = self.query(x_ref)
+
+            x_adv = torch.clamp(x_adv, 0, 1)
+
+            # Final success check for this iteration
+            if pred != target_class and t > 10:
+                print(f"[!] HSJA-CAMOUFLAGE SUCCESS at query {t}")
+                return x_adv.unsqueeze(0), [t]
+
+        return x_adv.unsqueeze(0), [T]
+
+    def untarget(self, x, y):
+        adv, iters = self.core(x, y)
+        return adv, iters, 0, 0

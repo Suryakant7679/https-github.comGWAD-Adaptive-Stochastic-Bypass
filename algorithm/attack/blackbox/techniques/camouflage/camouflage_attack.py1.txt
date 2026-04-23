@@ -1,0 +1,88 @@
+import torch
+import numpy as np
+from algorithm.attack.base import Query
+
+print("🔥 CAMOUFLAGE V4 (TOTAL BYPASS: SCREENER + HODS) LOADED")
+
+class CamouflageAttack(object):
+    def __init__(self, device, model=None, q_budgets=None, stop=True, data_type='cifar10', cfg=None):
+        self.device = device
+        self.model = model
+        self.q_budgets = q_budgets if q_budgets is not None else [10000]
+
+        # --- TUNED FOR SCREENER BYPASS ---
+        self.alpha_attack = 0.05  # Low step size to keep edges intact
+        self.sigma = 0.001        # NES search radius
+        self.nes_samples = 4
+        
+        self.ref_pool = []
+
+    def set_adaptive(self, adapt_type, move_rate, batch_size, x2_pool):
+        if x2_pool is not None:
+            self.ref_pool = x2_pool[:50]
+        print(f"[*] Adaptive V4 Synced. Pool Size: {len(self.ref_pool)}")
+
+    def query(self, x):
+        if x.dim() == 3: x = x.unsqueeze(0)
+        with torch.no_grad():
+            q = Query(t='attack', x=x)
+            return self.model(q)
+
+    def get_ref(self):
+        if len(self.ref_pool) == 0: return None
+        idx = np.random.randint(0, len(self.ref_pool))
+        return self.ref_pool[idx].to(self.device)
+
+    def nes_gradient(self, x_adv, target_class):
+        grad = torch.zeros_like(x_adv)
+        for _ in range(self.nes_samples):
+            u = torch.randn_like(x_adv)
+            f1 = self.query(x_adv + self.sigma * u)[0]
+            f2 = self.query(x_adv - self.sigma * u)[0]
+            
+            # Focused loss for faster convergence with low noise
+            loss1 = f1[target_class] 
+            loss2 = f2[target_class]
+            grad += (loss1 - loss2) * u
+            
+        grad = grad / (self.nes_samples * self.sigma)
+        norm = torch.norm(grad)
+        return grad / (norm + 1e-8) if norm > 0 else grad
+
+    def core(self, x_start, y):
+        x_adv = x_start.clone().detach().squeeze(0)
+        target_class = y.item()
+        T = int(self.q_budgets[0])
+        
+        for t in range(T):
+            # 1. Attack Step (NES Gradient)
+            grad = self.nes_gradient(x_adv, target_class)
+            x_adv = x_adv - self.alpha_attack * grad # Gradient Descent to reduce target logit
+            
+            # 2. HoDS Bypass (Trajectory Diversification)
+            if t % 3 == 0:
+                # Add tiny jitter to break Delta Similarity pattern
+                x_adv = x_adv + 0.002 * torch.randn_like(x_adv)
+
+            # 3. Screener Bypass (Benign Injection)
+            if t % 7 == 0:
+                x_ref = self.get_ref()
+                if x_ref is not None:
+                    # Flush the detector window with a benign query
+                    _ = self.query(x_ref)
+
+            x_adv = torch.clamp(x_adv, 0, 1)
+
+            # 4. Check Success
+            out = self.query(x_adv)
+            pred = torch.argmax(out, dim=1).item()
+
+            if pred != target_class:
+                print(f"[!] SUCCESS: Bypassed at query {t}")
+                return x_adv.unsqueeze(0), [t]
+
+        return x_adv.unsqueeze(0), [T]
+
+    def untarget(self, x, y):
+        adv, iters = self.core(x, y)
+        return adv, iters, 0, 0

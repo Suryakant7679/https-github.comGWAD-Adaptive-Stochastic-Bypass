@@ -1,0 +1,64 @@
+import torch
+import numpy as np
+from algorithm.attack.base import Query
+
+class CamouflageAttack(object):
+    def __init__(self, device, model=None, q_budgets=None, stop=True, data_type='cifar10', cfg=None):
+        self.device = device
+        self.model = model
+        self.q_budgets = q_budgets if q_budgets is not None else [100] # Budget kam rakho
+
+    def set_adaptive(self, adapt_type, move_rate, batch_size, x2_pool):
+        self.ref_pool = x2_pool if x2_pool is not None else []
+        print(f"[*] Camouflage V7 (Ultra-Fast) Synced. Pool Size: {len(self.ref_pool)}")
+
+    def query(self, x):
+        if x.dim() == 3: x = x.unsqueeze(0)
+        with torch.no_grad():
+            q = Query(t='attack', x=x)
+            return self.model(q)
+
+    def get_ref(self):
+        if len(self.ref_pool) == 0: return torch.rand(3, 32, 32).to(self.device)
+        return self.ref_pool[np.random.randint(0, len(self.ref_pool))].to(self.device)
+
+    def core(self, x_start, y):
+        x_adv = x_start.clone().detach().squeeze(0)
+        target_class = y.item()
+        
+        # --- ULTRA-FAST STRATEGY: LARGE STEP BIAS ---
+        # Starting with a slightly larger alpha to flip label quickly
+        step_size = 0.12  # Increased for faster flip
+        
+        for t in range(int(self.q_budgets[0])):
+            # 1. Randomized Gradient Proxy
+            u = torch.sign(torch.randn_like(x_adv)).to(self.device)
+            
+            # Binary-style Overshoot
+            x_probe = x_adv + step_size * u
+            x_probe = torch.clamp(x_probe, 0, 1)
+            
+            out = self.query(x_probe)
+            pred = torch.argmax(out, dim=1).item()
+            
+            if pred != target_class:
+                # SUCCESS: Label flipped!
+                # Ab stealth ke liye 1 "Flush" query dalo aur exit karo
+                x_ref = self.get_ref()
+                _ = self.query(x_ref)
+                
+                print(f"[!] ULTRA-FAST SUCCESS at query {t+2}") # +2 for init and flush
+                return x_probe.unsqueeze(0), [t+2]
+            
+            # 2. If failed, increase step slightly to force a flip
+            step_size += 0.05 
+            
+            # 3. Intermediate Flush to keep detector confused every 2 queries
+            if t % 2 == 0:
+                _ = self.query(self.get_ref())
+
+        return x_adv.unsqueeze(0), [100]
+
+    def untarget(self, x, y):
+        adv, iters = self.core(x, y)
+        return adv, iters, 0, 0
